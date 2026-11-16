@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from textwrap import dedent
 
@@ -26,9 +25,12 @@ st.set_page_config(
 DATA_DIR = Path(__file__).parent
 
 # File names match what Spotify_Clustering_Final.ipynb writes:
-#   spotify_cleaned.csv          (section 8)
-#   spotify_scaled_features.csv  (section 8)
-#   spotify_clusters.csv         (section 18) - final cluster label per song
+#   spotify_cleaned.csv          (section 8)  - one row per song, all columns
+#   spotify_scaled_features.csv  (section 8)  - the 9 standardised features
+#   spotify_clusters.csv         (section 18) - track_id, track_name, artists,
+#                                               track_genre, all_genres,
+#                                               popularity, cluster
+# All three files are row-aligned (83,337 songs in the notebook run).
 FILES = {
     "clusters": "spotify_clusters.csv",
     "scaled": "spotify_scaled_features.csv",
@@ -81,6 +83,11 @@ FEATURE_DESCRIPTIONS = {
     "tempo": "Fast-paced",
     "loudness": "Loud"
 }
+
+# Cluster naming rules (notebook section 16: genre was NOT used for
+# clustering, so a genre only names a cluster when it clearly dominates it).
+GENRE_LABEL_MIN_SHARE = 0.12   # top-2 genres must cover >= 12% of the cluster
+SINGLE_GENRE_SHARE = 0.50      # one genre alone names the cluster at >= 50%
 
 # A restrained editorial palette: forest, sage, clay and muted jewel tones.
 PALETTE = [
@@ -672,14 +679,21 @@ def rgba(hex_color, alpha=0.3):
 
 
 def make_cluster_names(profile, songs=None):
-    """Create readable cluster labels using each cluster's dominant genre.
+    """Create readable cluster labels that match the notebook's interpretation.
 
-    The audio-feature profile is still used to generate the explanatory
-    description. The visible label uses the most frequent track_genre in
-    that cluster, e.g. "Cluster 6: Salsa".
+    Genre was not an input to the clustering (notebook section 3), so a genre
+    only names a cluster when it clearly dominates it:
+      * one genre >= 50% of the cluster  -> "Cluster 2: Comedy"
+      * top-2 genres cover >= 12%        -> "Cluster 0: New Age / Ambient"
+      * otherwise the cluster is mixed   -> "Cluster 6: Mixed genres · Upbeat"
+    The audio-feature profile (mean z-scores, notebook section 16) always
+    supplies the explanatory description.
     """
     names = {}
     descriptions = {}
+
+    def pretty(genre):
+        return str(genre).replace("_", " ").replace("-", " ").title()
 
     for cluster_id, row in profile.iterrows():
         cluster_id = int(cluster_id)
@@ -688,16 +702,42 @@ def make_cluster_names(profile, songs=None):
             if f in row.index and pd.notna(row[f])
         ]
 
-        # Find the most common genre among songs assigned to this cluster.
-        dominant_genre = None
+        # Leading genres (by primary track_genre) and their share of the cluster.
+        genre_label = None
+        genre_sentence = None
         if songs is not None and "track_genre" in songs.columns and "cluster" in songs.columns:
             cluster_genres = songs.loc[
                 songs["cluster"] == cluster_id, "track_genre"
             ].dropna().astype(str).str.strip()
             cluster_genres = cluster_genres[cluster_genres.ne("")]
             if not cluster_genres.empty:
-                dominant_genre = cluster_genres.value_counts().index[0]
-                dominant_genre = dominant_genre.replace("_", " ").replace("-", " ").title()
+                shares = cluster_genres.value_counts(normalize=True)
+                top_genre_name = pretty(shares.index[0])
+                top_genre_share = float(shares.iloc[0])
+                top_two = shares.head(2)
+
+                if top_genre_share >= SINGLE_GENRE_SHARE:
+                    genre_label = top_genre_name
+                    genre_sentence = (
+                        f"{top_genre_name} makes up {top_genre_share * 100:.0f}% "
+                        f"of this cluster. "
+                    )
+                elif top_two.sum() >= GENRE_LABEL_MIN_SHARE:
+                    genre_label = " / ".join(pretty(g) for g in top_two.index)
+                    parts = [
+                        f"{pretty(g)} ({v * 100:.0f}%)"
+                        for g, v in top_two.items()
+                    ]
+                    genre_sentence = (
+                        f"The leading genres are {' and '.join(parts)}. "
+                    )
+                else:
+                    genre_sentence = (
+                        f"No single genre dominates this cluster (the most "
+                        f"common, {top_genre_name}, covers only "
+                        f"{top_genre_share * 100:.0f}% of its songs), so it "
+                        f"is labelled by its sound instead. "
+                    )
 
         if available:
             sorted_features = row[available].sort_values(ascending=False)
@@ -734,8 +774,13 @@ def make_cluster_names(profile, songs=None):
             positive_feature = None
             audio_description = "Audio profile unavailable"
 
-        if dominant_genre:
-            names[cluster_id] = f"Cluster {cluster_id}: {dominant_genre}"
+        if genre_label:
+            names[cluster_id] = f"Cluster {cluster_id}: {genre_label}"
+        elif genre_sentence:
+            # Mixed cluster: no genre dominates, so describe the sound.
+            names[cluster_id] = (
+                f"Cluster {cluster_id}: Mixed genres · {audio_description}"
+            )
         else:
             # Fallback when the dataset has no genre column/value.
             names[cluster_id] = f"Cluster {cluster_id}: {audio_description}"
@@ -748,13 +793,9 @@ def make_cluster_names(profile, songs=None):
         else:
             feature_sentence = "The audio-feature profile is unavailable. "
 
-        if dominant_genre:
-            descriptions[cluster_id] = (
-                f"{dominant_genre} is the most common genre label in this cluster. "
-                f"{feature_sentence}{audio_description}."
-            )
-        else:
-            descriptions[cluster_id] = f"{feature_sentence}{audio_description}."
+        descriptions[cluster_id] = (
+            f"{genre_sentence or ''}{feature_sentence}{audio_description}."
+        )
 
     return names, descriptions
 
@@ -884,11 +925,11 @@ def calculate_pca():
 
     pca = PCA(
         n_components=3,
-        random_state=0  # same seed as the notebook (cell 37)
+        random_state=0  # SEED = 0, same as the notebook (section 15)
     )
 
     coordinates = pca.fit_transform(
-        scaled.to_numpy()
+        scaled.to_numpy(dtype=np.float32)  # notebook X is float32
     )
 
     return coordinates, pca.explained_variance_ratio_
@@ -906,11 +947,12 @@ def calculate_silhouette():
 
     sample_size = min(10000, len(songs))
 
+    # Same settings as the notebook: SIL_SAMPLE = 10,000, SEED = 0, float32 X.
     return silhouette_score(
-        scaled.to_numpy(),
+        scaled.to_numpy(dtype=np.float32),
         labels,
         sample_size=sample_size,
-        random_state=0  # same seed as the notebook (cell 37)
+        random_state=0
     )
 
 
@@ -924,7 +966,7 @@ def get_neighbour_model():
         metric="euclidean"
     )
 
-    model.fit(scaled.to_numpy())
+    model.fit(scaled.to_numpy(dtype=np.float32))
 
     return model
 
@@ -2022,7 +2064,7 @@ def tab_song_explorer(songs, names):
         _, scaled, _, _, _ = load_data()
 
         distances, indices = get_neighbour_model().kneighbors(
-            scaled.iloc[[position]].to_numpy(),
+            scaled.iloc[[position]].to_numpy(dtype=np.float32),
             n_neighbors=min(51, len(songs))
         )
 
@@ -2612,7 +2654,7 @@ def main():
             <div><strong>{songs['cluster'].nunique():,}</strong><span>Clusters</span></div>
         </div>
         <div class="sidebar-footnote">
-            Cluster names are descriptive labels generated from average audio-feature profiles.
+            Cluster names come from each cluster leading genres and its average audio-feature profile. Genre was not used to form the clusters.
         </div>
         """))
 
